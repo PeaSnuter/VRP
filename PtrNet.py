@@ -510,8 +510,7 @@ def reward_fn(tour, graph, mapping_table, requests):
     :param tour: a solution of vehicle k
     :param graph: tour graph creation for vehicle k (i.e. small graph)
     :param mapping_table: mapping table
-    :param requests: a list of (tuple(p, d), deadline, required_capacity) and
-    p, d denote pickup and delivery location respectively
+    :param requests:
     :return:
     """
     dest_id = None
@@ -572,3 +571,22 @@ def reward_fn(tour, graph, mapping_table, requests):
 
     C_L_star = cur_capacity
 
+
+def find_node(graph, p):
+    for node in graph:
+        if node.serial_number == p:
+            return node
+
+
+def reward_fn5(tour, graph, reqs):
+    E0 = graph[0].type.initial_energy
+    E_max = graph[0].type.battery_size
+    energy = E0
+    energy_rw = 0
+    for i in range(len(tour) - 1):
+        if find_node(graph, tour[i]).type.name == 'Depot':
+            energy = energy - energy + E_max
+        energy = energy - find_something(tour[i], tour[i + 1], graph, 'energy')
+        if energy < 0:
+            energy_rw += -energy
+    return energy_rw
