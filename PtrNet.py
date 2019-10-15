@@ -85,8 +85,8 @@ class Attention(nn.Module):
         if self.use_tanh:
             logits = self.C * self.tanh(u)
         else:
-            logits = u
-        return e, logits
+            logits = u # [batch_size x sourceL]
+        return e, logits #e is for glimpse,logits is before softmax
 
 
 class Decoder(nn.Module):
@@ -119,7 +119,11 @@ class Decoder(nn.Module):
 
     def apply_mask_to_logits(self, logits, mask, prev_idxs):
         if mask is None:
-            mask = torch.zeros(logits.size()).byte()  # dtype=torch.uint8
+            mask = torch.zeros(logits.size()).byte()  # mask:[batch_size x sourceL]
+
+            choose_i = torch.LongTensor([0])##
+            mask.index_fill_(1, choose_i, 1)##
+
             if self.use_cuda:
                 mask = mask.cuda()
 
@@ -133,18 +137,36 @@ class Decoder(nn.Module):
             logits[maskk] = -np.inf
         return logits, maskk
 
-    def forward(self, decoder_input, embedded_inputs, hidden, context):
+    def forward(self, decoder_input, embedded_inputs, hidden, context,batch_node_list,batch_ser_num_list):
         """
         Args:
             decoder_input: The initial input to the decoder
                 size is [batch_size x embedding_dim]. Trainable parameter.
-            embedded_inputs: [sourceL x batch_size x embedding_dim]
+            embedded_inputs: [sourceL x batch_size x embedding_dim] encoder's embedded_inputs
             hidden: the prev hidden state, size is [batch_size x hidden_dim].
                 Initially this is set to (enc_h[-1], enc_c[-1])
             context: encoder outputs, [sourceL x batch_size x hidden_dim]
         """
 
-        def recurrence(x, hidden, logit_mask, prev_idxs):
+        def apply_graphmask_to_logits(logits,mask,prev_idxs,batch_node_list,batch_ser_num_list):
+
+            graphmask = mask.clone() #[batch_size x sourceL]
+            graphlogits=logits.clone() #[batch_size x sourceL]
+
+            for i,(prev_idx,maskki,logitssi,node_list,ser_num_list) in enumerate(zip(prev_idxs,graphmask,graphlogits,batch_node_list,batch_ser_num_list)):
+                for node in node_list:
+                    if node.serial_number == prev_idx:
+                        graphmask[i].fill_(1)
+                        for edge in node.edges:
+                            graphmask[i][edge.to]=0
+
+            graphlogits[graphmask]=-np.inf
+            return graphlogits,graphmask
+
+
+
+        def recurrence(x, hidden, logit_mask, prev_idxs):#hx, cx, probs, mask = recurrence(decoder_input, hidden, mask, idxs)
+
 
             hx, cx = hidden  # batch_size x hidden_dim
             # gates: [batch_size x (hidden_dim x 4)]
@@ -161,15 +183,18 @@ class Decoder(nn.Module):
 
             g_l = hy
             for _ in range(self.n_glimpses):
-                ref, logits = self.glimpse(g_l, context)
+                ref, logits = self.glimpse(g_l, context)  #logits:[batch_size x sourceL]
                 logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
+                graphlogits,graphmask=apply_graphmask_to_logits(logits,logit_mask,prev_idxs,batch_node_list,batch_ser_num_list)
                 # [batch_size x h_dim x sourceL] * [batch_size x sourceL x 1] = [batch_size x h_dim x 1]
-                g_l = torch.bmm(ref, self.sm(logits).unsqueeze(2)).squeeze(2)
+                #g_l = torch.bmm(ref, self.sm(logits).unsqueeze(2)).squeeze(2)
+                g_l = torch.bmm(ref, self.sm(graphlogits).unsqueeze(2)).squeeze(2)
             _, logits = self.pointer(g_l, context)
 
             logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
-            probs = self.sm(logits)
-            return hy, cy, probs, logit_mask
+            graphlogits, graphmask = apply_graphmask_to_logits(logits, logit_mask, prev_idxs, batch_node_list,batch_ser_num_list)
+            probs = self.sm(graphlogits)
+            return hy, cy, probs, graphmask
 
         def topk(x, k):
             a = [(idx, e[-1]) for (idx, e) in enumerate(x)]
@@ -180,13 +205,31 @@ class Decoder(nn.Module):
             return [x[e[0]] for e in a[-k:]]
 
         batch_size = context.size(1)
+        sourceL=context.size(0)
         outputs = []
         selections = []
-        idxs = None
+        #idxs = None
+        idxs = torch.ones(batch_size)#
+        selections.append(idxs)#
+
+        choose_i = torch.LongTensor([0])
+        prob1=torch.zeros(batch_size, sourceL)
+        prob1.index_fill_(1, choose_i, 1)
+        outputs.append(prob1)
+
+
         mask = None
+        if mask is None:##
+            mask = torch.zeros(batch_size,self.seq_len).byte()  # dtype=torch.uint8,mask:[batch_size x sourceL]
+
+            choose_i = torch.LongTensor([0])  ##
+            mask.index_fill_(1, choose_i, 1)  ##
+
+            if self.use_cuda:
+                mask = mask.cuda()
 
         if self.decode_type == 'stochastic':
-            for _ in range(self.seq_len):
+            for _ in range(self.seq_len-1):
                 hx, cx, probs, mask = recurrence(decoder_input, hidden, mask, idxs)
                 hidden = (hx, cx)
                 # select the next inputs for the decoder [batch_size x hidden_dim]
@@ -204,7 +247,7 @@ class Decoder(nn.Module):
             # hidden: [batch_size x hidden_dim]
             # context: [sourceL x batch_size x hidden_dim]
             sel_cands = [[[list(), 0.0]] for _ in range(batch_size)]
-            for seq_id in range(self.seq_len):
+            for seq_id in range(self.seq_len-1):
                 # probs: [batch_size x sourceL]
                 hx, cx, probs, mask = recurrence(decoder_input, hidden, mask, idxs)
                 hidden = (hx, cx)
@@ -309,7 +352,7 @@ class PointerNetwork(nn.Module):
         self.decoder_in_0 = nn.Parameter(dec_in_0)
         self.decoder_in_0.data.uniform_(-1. / math.sqrt(embedding_dim), 1. / math.sqrt(embedding_dim))
 
-    def forward(self, inputs):
+    def forward(self, inputs,batch_node_list,batch_ser_num_list):
         """ Propagate inputs through the network
         Args:
             inputs: [sourceL x batch_size x embedding_dim]
@@ -332,7 +375,7 @@ class PointerNetwork(nn.Module):
         (pointer_probs, input_idxs), dec_hidden_t = self.decoder(decoder_input,
                                                                  inputs,
                                                                  dec_init_state,
-                                                                 enc_h)
+                                                                 enc_h,batch_node_list,batch_ser_num_list)
 
         return pointer_probs, input_idxs
 
@@ -436,11 +479,28 @@ class NeuralCombOptRL(nn.Module):
 
         self.embedding = nn.Linear(input_dim, embedding_dim)
 
-    def forward(self, inputs):
+    def forward(self, inputs,batch_graph):
         """
         Args:
             inputs: [batch_size, sourceL, input_dim]
         """
+        batch_node_list = batch_graph.deepcopy()  # 小图的节点列表
+        batch_ser_num_list = []  # mapping table
+
+        for node_list in batch_node_list:
+            ser_num_list = []
+            for node in node_list:
+                ser_num_list.append(node.serial_number)
+
+            for node in node_list:
+                node.serial_number = ser_num_list.index(node.serial_number)
+                for edge in node.edges:
+                    edge.to = ser_num_list.index(edge.to)
+            batch_ser_num_list.append(ser_num_list)
+
+
+
+
         batch_size = inputs.size(0)
 
         # [sourceL x batch_size x embedding_dim]
@@ -448,7 +508,7 @@ class NeuralCombOptRL(nn.Module):
 
         # query the actor net for the input indices
         # making up the output, and the pointer attn
-        probs_, action_idxs = self.actor_net(embedded_inputs)
+        probs_, action_idxs = self.actor_net(embedded_inputs,batch_node_list,batch_ser_num_list)
         # probs_: [seq_len x batch_size x seq_len], action_idxs: [seq_len x batch_size]
 
         # Select the actions (inputs pointed to by the pointer net)
